@@ -27,7 +27,7 @@ function loadData() {
   } catch {
     console.error('Failed to load data.json, starting fresh.');
   }
-  return { notifiedVideoIds: [] };
+  return { notifiedVideoIds: [], initialized: false };
 }
 
 function saveData(data) {
@@ -35,6 +35,30 @@ function saveData(data) {
 }
 
 let data = loadData();
+
+// === FIRST RUN: silently record existing videos without notifying ===
+async function seedExistingVideos() {
+  try {
+    const searchRes = await youtube.search.list({
+      part: 'snippet',
+      channelId: YOUTUBE_CHANNEL_ID,
+      order: 'date',
+      maxResults: 10,
+      type: 'video',
+    });
+    const items = searchRes.data.items || [];
+    for (const item of items) {
+      if (!data.notifiedVideoIds.includes(item.id.videoId)) {
+        data.notifiedVideoIds.push(item.id.videoId);
+      }
+    }
+    data.initialized = true;
+    saveData(data);
+    console.log(`📋 Seeded ${items.length} existing videos (no notifications sent).`);
+  } catch (err) {
+    console.error('Seed error:', err.message || err);
+  }
+}
 
 // === DISCORD CLIENT ===
 const client = new Client({
@@ -240,13 +264,20 @@ client.once('ready', () => {
   console.log(`📡 Monitoring YouTube channel: ${YOUTUBE_CHANNEL_ID}`);
   console.log(`📢 Posting to Discord channel: ${DISCORD_CHANNEL_ID}`);
 
-  // Initial poll
-  pollYouTube();
-  pollLiveStreams();
-
-  // Schedule polls
-  setInterval(pollYouTube, POLL_INTERVAL);
-  setInterval(pollLiveStreams, POLL_INTERVAL);
+  // On first run, seed existing videos silently, then start polling
+  if (!data.initialized) {
+    seedExistingVideos().then(() => {
+      console.log('🟢 First run complete. Now watching for NEW content only.');
+      setInterval(pollYouTube, POLL_INTERVAL);
+      setInterval(pollLiveStreams, POLL_INTERVAL);
+    });
+  } else {
+    // Normal run — poll immediately then schedule
+    pollYouTube();
+    pollLiveStreams();
+    setInterval(pollYouTube, POLL_INTERVAL);
+    setInterval(pollLiveStreams, POLL_INTERVAL);
+  }
 });
 
 client.login(DISCORD_TOKEN);

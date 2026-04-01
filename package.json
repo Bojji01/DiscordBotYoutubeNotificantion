@@ -1,0 +1,14 @@
+{
+  "name": "youtube-discord-notifier",
+  "version": "1.0.0",
+  "description": "Discord bot that notifies when new YouTube videos, shorts, or live streams are uploaded",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.7",
+    "googleapis": "^144.0.0"
+  }
+}

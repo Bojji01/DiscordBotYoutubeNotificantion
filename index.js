@@ -27,7 +27,11 @@ function loadData() {
   } catch {
     console.error('Failed to load data.json, starting fresh.');
   }
-  return { notifiedVideoIds: [], initialized: false };
+  return {
+    notifiedVideoIds: [],  // videos & shorts already notified
+    activeLiveIds: [],     // live streams currently active (notified)
+    initialized: false,
+  };
 }
 
 function saveData(data) {
@@ -35,6 +39,16 @@ function saveData(data) {
 }
 
 let data = loadData();
+// Ensure fields exist for old data.json files
+if (!data.activeLiveIds) data.activeLiveIds = [];
+
+// === DISCORD CLIENT ===
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
+});
+
+// === YOUTUBE CLIENT ===
+const youtube = google.youtube({ version: 'v3', auth: YOUTUBE_API_KEY });
 
 // === FIRST RUN: silently record existing videos without notifying ===
 async function seedExistingVideos() {
@@ -43,7 +57,7 @@ async function seedExistingVideos() {
       part: 'snippet',
       channelId: YOUTUBE_CHANNEL_ID,
       order: 'date',
-      maxResults: 10,
+      maxResults: 15,
       type: 'video',
     });
     const items = searchRes.data.items || [];
@@ -60,32 +74,14 @@ async function seedExistingVideos() {
   }
 }
 
-// === DISCORD CLIENT ===
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
-});
-
-// === YOUTUBE CLIENT ===
-const youtube = google.youtube({ version: 'v3', auth: YOUTUBE_API_KEY });
-
 // === CONTENT TYPE DETECTION ===
 function getContentType(video) {
-  // Live stream: has liveStreamingDetails or liveBroadcastContent is 'live' or 'upcoming'
-  const liveBroadcast = video.snippet?.liveBroadcastContent;
-  if (liveBroadcast === 'live' || liveBroadcast === 'upcoming') {
-    return 'LIVE';
-  }
-  if (video.liveStreamingDetails) {
-    return 'LIVE';
-  }
-
-  // Short: vertical video (height > width) AND duration <= 60 seconds
+  // Short: duration <= 60 seconds
   const duration = video.contentDetails?.duration || '';
   const seconds = parseDuration(duration);
   if (seconds > 0 && seconds <= 60) {
     return 'SHORT';
   }
-
   return 'VIDEO';
 }
 
@@ -121,14 +117,16 @@ const EMBED_CONFIG = {
 function buildEmbed(video, type) {
   const config = EMBED_CONFIG[type];
   const snippet = video.snippet;
-  const videoUrl = `https://youtu.be/${video.id}`;
+  const videoUrl = type === 'SHORT'
+    ? `https://youtube.com/shorts/${video.id}`
+    : `https://youtu.be/${video.id}`;
 
   const embed = new EmbedBuilder()
     .setColor(config.color)
     .setTitle(`${config.emoji} ${snippet.title}`)
     .setURL(videoUrl)
     .setDescription(config.label)
-    .setThumbnail(
+    .setImage(
       snippet.thumbnails?.maxres?.url ||
       snippet.thumbnails?.high?.url ||
       snippet.thumbnails?.default?.url
@@ -143,10 +141,10 @@ function buildEmbed(video, type) {
   return embed;
 }
 
-// === POLLING LOGIC ===
-async function pollYouTube() {
+// === POLL FOR NEW VIDEOS & SHORTS ===
+async function pollNewUploads() {
   try {
-    // 1) Check for new uploads via search (ordered by date)
+    // Search for recent uploads (excludes live streams)
     const searchRes = await youtube.search.list({
       part: 'snippet',
       channelId: YOUTUBE_CHANNEL_ID,
@@ -158,14 +156,13 @@ async function pollYouTube() {
     const items = searchRes.data.items;
     if (!items || items.length === 0) return;
 
-    // Filter out already-notified videos
+    // Filter out already-notified
     const newItems = items.filter(
       (item) => !data.notifiedVideoIds.includes(item.id.videoId)
     );
-
     if (newItems.length === 0) return;
 
-    // 2) Get full video details (duration, liveStreamingDetails)
+    // Get full video details to classify video vs short
     const videoIds = newItems.map((item) => item.id.videoId).join(',');
     const videoRes = await youtube.videos.list({
       part: 'snippet,contentDetails,liveStreamingDetails',
@@ -178,12 +175,15 @@ async function pollYouTube() {
       return;
     }
 
-    // 3) Send notifications (oldest first)
-    const videos = videoRes.data.items || [];
-    videos.reverse();
+    // Send notifications (oldest first)
+    const videos = (videoRes.data.items || []).reverse();
 
     for (const video of videos) {
       if (data.notifiedVideoIds.includes(video.id)) continue;
+
+      // Skip if it's currently a live stream (handled by pollLiveStreams)
+      const liveBroadcast = video.snippet?.liveBroadcastContent;
+      if (liveBroadcast === 'live' || liveBroadcast === 'upcoming') continue;
 
       const type = getContentType(video);
       const embed = buildEmbed(video, type);
@@ -195,20 +195,18 @@ async function pollYouTube() {
 
       console.log(`Notified: [${type}] ${video.snippet.title}`);
 
-      // Save as notified
       data.notifiedVideoIds.push(video.id);
-      // Keep only last 50 IDs to avoid unbounded growth
-      if (data.notifiedVideoIds.length > 50) {
-        data.notifiedVideoIds = data.notifiedVideoIds.slice(-50);
+      if (data.notifiedVideoIds.length > 100) {
+        data.notifiedVideoIds = data.notifiedVideoIds.slice(-100);
       }
       saveData(data);
     }
   } catch (err) {
-    console.error('YouTube poll error:', err.message || err);
+    console.error('Upload poll error:', err.message || err);
   }
 }
 
-// === ALSO CHECK FOR ACTIVE LIVE STREAMS ===
+// === POLL FOR ACTIVE LIVE STREAMS ===
 async function pollLiveStreams() {
   try {
     const searchRes = await youtube.search.list({
@@ -219,15 +217,16 @@ async function pollLiveStreams() {
       maxResults: 3,
     });
 
-    const items = searchRes.data.items;
-    if (!items || items.length === 0) return;
+    const items = searchRes.data.items || [];
+    const currentLiveIds = items.map((item) => item.id.videoId);
 
     const channel = await client.channels.fetch(DISCORD_CHANNEL_ID);
     if (!channel) return;
 
+    // Notify for streams that just went live (not already notified)
     for (const item of items) {
       const videoId = item.id.videoId;
-      if (data.notifiedVideoIds.includes(videoId)) continue;
+      if (data.activeLiveIds.includes(videoId)) continue;
 
       // Get full video details
       const videoRes = await youtube.videos.list({
@@ -247,11 +246,22 @@ async function pollLiveStreams() {
 
       console.log(`Notified: [LIVE] ${video.snippet.title}`);
 
-      data.notifiedVideoIds.push(videoId);
-      if (data.notifiedVideoIds.length > 50) {
-        data.notifiedVideoIds = data.notifiedVideoIds.slice(-50);
+      data.activeLiveIds.push(videoId);
+      // Also add to notifiedVideoIds so we don't re-notify as a "new upload" later
+      if (!data.notifiedVideoIds.includes(videoId)) {
+        data.notifiedVideoIds.push(videoId);
       }
       saveData(data);
+    }
+
+    // Clean up ended streams from activeLiveIds
+    const ended = data.activeLiveIds.filter((id) => !currentLiveIds.includes(id));
+    if (ended.length > 0) {
+      data.activeLiveIds = data.activeLiveIds.filter((id) => currentLiveIds.includes(id));
+      saveData(data);
+      for (const id of ended) {
+        console.log(`Stream ended: ${id}`);
+      }
     }
   } catch (err) {
     console.error('Live stream poll error:', err.message || err);
@@ -264,18 +274,18 @@ client.once('ready', () => {
   console.log(`📡 Monitoring YouTube channel: ${YOUTUBE_CHANNEL_ID}`);
   console.log(`📢 Posting to Discord channel: ${DISCORD_CHANNEL_ID}`);
 
-  // On first run, seed existing videos silently, then start polling
   if (!data.initialized) {
+    // First run: seed existing videos, then start polling
     seedExistingVideos().then(() => {
       console.log('🟢 First run complete. Now watching for NEW content only.');
-      setInterval(pollYouTube, POLL_INTERVAL);
+      setInterval(pollNewUploads, POLL_INTERVAL);
       setInterval(pollLiveStreams, POLL_INTERVAL);
     });
   } else {
     // Normal run — poll immediately then schedule
-    pollYouTube();
+    pollNewUploads();
     pollLiveStreams();
-    setInterval(pollYouTube, POLL_INTERVAL);
+    setInterval(pollNewUploads, POLL_INTERVAL);
     setInterval(pollLiveStreams, POLL_INTERVAL);
   }
 });

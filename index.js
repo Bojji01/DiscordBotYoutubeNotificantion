@@ -144,30 +144,36 @@ function buildEmbed(video, type) {
 // === POLL FOR NEW VIDEOS & SHORTS ===
 async function pollNewUploads() {
   try {
-    // Search for recent uploads (excludes live streams)
+    // Only fetch the 1 most recent upload
     const searchRes = await youtube.search.list({
       part: 'snippet',
       channelId: YOUTUBE_CHANNEL_ID,
       order: 'date',
-      maxResults: 5,
+      maxResults: 1,
       type: 'video',
     });
 
     const items = searchRes.data.items;
     if (!items || items.length === 0) return;
 
-    // Filter out already-notified
-    const newItems = items.filter(
-      (item) => !data.notifiedVideoIds.includes(item.id.videoId)
-    );
-    if (newItems.length === 0) return;
+    const item = items[0];
+    const videoId = item.id.videoId;
+
+    // Already notified about this one
+    if (data.notifiedVideoIds.includes(videoId)) return;
 
     // Get full video details to classify video vs short
-    const videoIds = newItems.map((item) => item.id.videoId).join(',');
     const videoRes = await youtube.videos.list({
       part: 'snippet,contentDetails,liveStreamingDetails',
-      id: videoIds,
+      id: videoId,
     });
+
+    const video = videoRes.data.items?.[0];
+    if (!video) return;
+
+    // Skip if it's currently a live stream (handled by pollLiveStreams)
+    const liveBroadcast = video.snippet?.liveBroadcastContent;
+    if (liveBroadcast === 'live' || liveBroadcast === 'upcoming') return;
 
     const channel = await client.channels.fetch(DISCORD_CHANNEL_ID);
     if (!channel) {
@@ -175,32 +181,21 @@ async function pollNewUploads() {
       return;
     }
 
-    // Send notifications (oldest first)
-    const videos = (videoRes.data.items || []).reverse();
+    const type = getContentType(video);
+    const embed = buildEmbed(video, type);
 
-    for (const video of videos) {
-      if (data.notifiedVideoIds.includes(video.id)) continue;
+    await channel.send({
+      content: '@everyone',
+      embeds: [embed],
+    });
 
-      // Skip if it's currently a live stream (handled by pollLiveStreams)
-      const liveBroadcast = video.snippet?.liveBroadcastContent;
-      if (liveBroadcast === 'live' || liveBroadcast === 'upcoming') continue;
+    console.log(`Notified: [${type}] ${video.snippet.title}`);
 
-      const type = getContentType(video);
-      const embed = buildEmbed(video, type);
-
-      await channel.send({
-        content: '@everyone',
-        embeds: [embed],
-      });
-
-      console.log(`Notified: [${type}] ${video.snippet.title}`);
-
-      data.notifiedVideoIds.push(video.id);
-      if (data.notifiedVideoIds.length > 100) {
-        data.notifiedVideoIds = data.notifiedVideoIds.slice(-100);
-      }
-      saveData(data);
+    data.notifiedVideoIds.push(video.id);
+    if (data.notifiedVideoIds.length > 100) {
+      data.notifiedVideoIds = data.notifiedVideoIds.slice(-100);
     }
+    saveData(data);
   } catch (err) {
     console.error('Upload poll error:', err.message || err);
   }
